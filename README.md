@@ -6,7 +6,7 @@ Finwave serves frozen, versioned wildlife photo-identification and detector
 datasets behind a small handshake API. `wavefront` turns that into one call.
 
 ```bash
-pip install wavefront
+pip install finwave-wavefront
 ```
 
 ## Quick start
