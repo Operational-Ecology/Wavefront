@@ -26,8 +26,6 @@ import logging
 from typing import Optional
 
 from .client import API_KEY_ENV, DEFAULT_BASE_URL, Client
-
-logging.getLogger("wavefront").addHandler(logging.NullHandler())
 from .exceptions import (
     APIError,
     AuthError,
@@ -37,6 +35,10 @@ from .exceptions import (
     WavefrontError,
 )
 from .models import Dataset, Manifest
+
+# Library logging best practice: attach a no-op handler so importing wavefront
+# never emits "No handlers could be found"; the application opts in to output.
+logging.getLogger("wavefront").addHandler(logging.NullHandler())
 
 __version__ = "0.1.0"
 __all__ = [
