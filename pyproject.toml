@@ -1,0 +1,36 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "wavefront"
+version = "0.1.0"
+description = "Official Python client for fetching finwave datasets over the dataset-API handshake."
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [{ name = "Alexander Barnhill", email = "alex.c.barnhill@gmail.com" }]
+keywords = ["finwave", "wildlife", "photo-identification", "datasets", "conservation", "yolo"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Topic :: Scientific/Engineering",
+    "Topic :: Scientific/Engineering :: Image Recognition",
+]
+dependencies = ["httpx>=0.24"]
+
+[project.urls]
+Homepage = "https://operationalecology.io"
+Source = "https://github.com/Operational-Ecology/Wavefront"
+"finwave" = "https://finwave.io"
+
+[project.optional-dependencies]
+test = ["pytest>=7", "respx>=0.20"]
+
+[project.scripts]
+wavefront = "wavefront.__main__:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/wavefront"]
