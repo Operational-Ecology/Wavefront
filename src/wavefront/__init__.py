@@ -40,7 +40,7 @@ from .models import Dataset, Manifest
 # never emits "No handlers could be found"; the application opts in to output.
 logging.getLogger("wavefront").addHandler(logging.NullHandler())
 
-__version__ = "0.1.1"
+__version__ = "0.2.0"
 __all__ = [
     "fetch",
     "manifest",

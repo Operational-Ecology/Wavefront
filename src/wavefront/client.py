@@ -17,14 +17,16 @@ configures logging itself.
 """
 from __future__ import annotations
 
+import json
 import logging
 import os
 import shutil
 import tempfile
 import time
 import zipfile
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Any, Callable, Optional
 
 import httpx
 
@@ -44,6 +46,8 @@ DEFAULT_BASE_URL = "https://finwave.io"
 API_KEY_ENV = ("FW_API_TOKEN", "WAVEFRONT_API_KEY", "FINWAVE_DATASET_API_KEY", "DATASET_API_KEY")
 _FORMAT_ALIASES = {"yolo": "Yolo", "coco": "Coco", "pascalvoc": "PascalVoc", "voc": "PascalVoc"}
 _COMPLETE_MARKER = ".wavefront-complete"
+#: Thread-pool size for concurrent per-image downloads in the manifest path.
+_MANIFEST_DOWNLOAD_WORKERS = 16
 
 
 def _mask(key: str) -> str:
@@ -209,7 +213,19 @@ class Client:
             return ds
 
         log.info("fetch: requesting download handshake…")
-        download_url = self._handshake(dataset_version_id, fmt)
+        handshake = self._handshake(dataset_version_id, fmt)
+
+        manifest_json = handshake.get("manifestJson")
+        if manifest_json:
+            return self._fetch_manifest(
+                manifest_json, out=out, marker=marker, manifest=m, fmt=fmt,
+                progress=progress,
+            )
+
+        download_url = handshake.get("downloadUrl")
+        if not download_url:
+            raise APIError("handshake response had neither manifestJson nor downloadUrl",
+                           payload=handshake)
         out.mkdir(parents=True, exist_ok=True)
         with tempfile.NamedTemporaryFile(suffix=".zip", delete=False) as tmp:
             tmp_path = Path(tmp.name)
@@ -231,7 +247,13 @@ class Client:
         return ds
 
     # ── internals ────────────────────────────────────────────────────────────
-    def _handshake(self, dataset_version_id: str, fmt: str) -> str:
+    def _handshake(self, dataset_version_id: str, fmt: str) -> dict:
+        """Mint a download handshake and return the full parsed response.
+
+        The response is either the *zip* style (a signed ``downloadUrl``) or the
+        *manifest* style (a ``manifestJson`` string enumerating per-image blob
+        URLs). The caller inspects which keys are present to pick the path.
+        """
         resp = self._get(dataset_version_id, params={"format": fmt})
         if resp.status_code == 404:
             payload = self._error_payload(resp)
@@ -246,13 +268,106 @@ class Client:
             raise APIError("handshake failed", status_code=resp.status_code,
                            payload=self._error_payload(resp))
         body = resp.json()
-        url = body.get("downloadUrl")
-        if not url:
-            raise APIError("handshake response had no downloadUrl",
-                           status_code=resp.status_code, payload=body)
-        log.info("handshake: signed URL minted (expires %s)",
-                 body.get("sasExpiresAt", "soon"))
-        return url
+        if body.get("manifestJson"):
+            log.info("handshake: manifest export received")
+        elif body.get("downloadUrl"):
+            log.info("handshake: signed URL minted (expires %s)",
+                     body.get("sasExpiresAt", "soon"))
+        return body
+
+    def _fetch_manifest(
+        self,
+        manifest_json: str,
+        *,
+        out: Path,
+        marker: Path,
+        manifest: Manifest,
+        fmt: str,
+        progress: Optional[Callable[[int, Optional[int]], None]] = None,
+    ) -> Dataset:
+        """Materialise a *manifest*-style export: per-image downloads + labels.
+
+        Each ``Item.Url`` is fetched concurrently into ``{out}/{RelativePath}``,
+        then a YOLO label file, ``classes.txt`` and ``data.yaml`` are written and
+        the completion marker is stamped with the fingerprint.
+        """
+        try:
+            data: dict[str, Any] = json.loads(manifest_json)
+        except (TypeError, ValueError) as e:
+            raise APIError(f"handshake manifestJson was not valid JSON: {e}") from e
+
+        items: list[dict] = list(data.get("Items", []) or [])
+        classes: list[str] = list(data.get("Classes", []) or [])
+        total = len(items)
+        log.info("manifest: %d samples, downloading images…", total)
+
+        out.mkdir(parents=True, exist_ok=True)
+        for child in out.iterdir():
+            if child.name == _COMPLETE_MARKER:
+                continue
+            shutil.rmtree(child) if child.is_dir() else child.unlink()
+
+        labels_dir = out / "labels"
+        labels_dir.mkdir(parents=True, exist_ok=True)
+
+        # Download every image concurrently; write its YOLO label alongside.
+        done = 0
+        if progress is not None:
+            progress(done, total)
+        with ThreadPoolExecutor(max_workers=_MANIFEST_DOWNLOAD_WORKERS) as pool:
+            futures = {pool.submit(self._fetch_item, item, out): item for item in items}
+            for future in as_completed(futures):
+                future.result()  # re-raise any APIError from the worker
+                done += 1
+                if progress is not None:
+                    progress(done, total)
+
+        (out / "classes.txt").write_text("".join(f"{c}\n" for c in classes))
+        self._write_data_yaml(out / "data.yaml", out, classes)
+        marker.write_text(manifest.fingerprint)
+        ds = Dataset.from_extracted(root=out, manifest=manifest, fmt=fmt)
+        log.info("manifest: ready → %s [%d images, %d labels, classes=%s]",
+                 out, ds.num_images, ds.num_labels, ds.classes)
+        return ds
+
+    def _fetch_item(self, item: dict, out: Path) -> None:
+        """Download one manifest item's image and write its YOLO label file."""
+        rel = item.get("RelativePath") or ""
+        url = item.get("Url")
+        if not rel or not url:
+            raise APIError(f"manifest item missing RelativePath/Url: {item.get('SampleId')!r}")
+
+        dest = out / rel
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            resp = httpx.get(url, timeout=httpx.Timeout(None, connect=30.0),
+                             follow_redirects=True)
+        except httpx.HTTPError as e:
+            raise APIError(f"image download failed for {rel}: {e}") from e
+        if resp.status_code != 200:
+            raise APIError(f"image download failed for {rel} (HTTP {resp.status_code})",
+                           status_code=resp.status_code)
+        dest.write_bytes(resp.content)
+
+        stem = Path(rel).stem
+        lines = [
+            f"{b.get('ClassIndex', 0)} {b['X']} {b['Y']} {b['Width']} {b['Height']}"
+            for b in (item.get("Boxes") or [])
+        ]
+        (out / "labels" / f"{stem}.txt").write_text(
+            "".join(f"{ln}\n" for ln in lines))
+
+    @staticmethod
+    def _write_data_yaml(path: Path, root: Path, classes: list[str]) -> None:
+        """Write a minimal Ultralytics-style ``data.yaml`` for the dataset."""
+        lines = [
+            f"path: {root}",
+            "train: images",
+            "val: images",
+            "names:",
+        ]
+        lines += [f"  {i}: {c}" for i, c in enumerate(classes)]
+        path.write_text("".join(f"{ln}\n" for ln in lines))
 
     def _download(self, url: str, dest: Path, *,
                   progress: Optional[Callable[[int, Optional[int]], None]] = None) -> None:
